@@ -21,7 +21,7 @@ ${materials.map((m: any, i: number) => `${i + 1}. ${m.name}${m.unit ? ' (' + m.u
 {"results":[{"name":"название из списка","price":1234.56,"unit":"ед","source":"магазин","url":"ссылка"}]}
 Если цена не найдена — price: null.`
 
-    const response = await anthropic.messages.create({
+    const response = await (anthropic.messages.create as any)({
       model: 'claude-sonnet-4-6',
       max_tokens: 2000,
       tools: [{ type: 'web_search_20250305' as any, name: 'web_search' }],
