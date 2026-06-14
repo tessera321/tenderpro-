@@ -13,7 +13,7 @@
     "react-dom": "^18",
     "@supabase/supabase-js": "^2.44.2",
     "@supabase/ssr": "^0.3.0",
-    "anthropic": "^0.24.3",
+    "@anthropic-ai/sdk": "^0.20.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
