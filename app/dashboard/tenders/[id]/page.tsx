@@ -110,7 +110,7 @@ export default function TenderPage({ params }: { params: { id: string } }) {
       addLog(`[${i + 1}–${Math.min(i + BATCH, purchaseMats.length)}/${purchaseMats.length}] ${batch.map((m: any) => m.name.split(' ').slice(0, 3).join(' ')).join(', ')}...`, 'log-s')
 
       try {
-        const res = await fetch('/api/prices', {
+        const res = await fetch('https://latlduzqzoqijpvmeecb.supabase.co/functions/v1/search-prices', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ materials: batch, org_id: profile?.org_id })
