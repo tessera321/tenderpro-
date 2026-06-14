@@ -1,8 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import Anthropic from '@anthropic-ai/sdk'
 import { createClient } from '@/lib/supabase'
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 export async function POST(req: NextRequest) {
   try {
@@ -12,7 +9,6 @@ export async function POST(req: NextRequest) {
     const prompt = `Ты помощник тендерного специалиста строительной компании в Москве.
 Найди актуальные цены (2025-2026) на строительные материалы и работы в Москве.
 Ищи на: petrovich.ru, leroymerlin.ru, vseinstrumenty.ru, у специализированных поставщиков.
-Для специфических материалов (химия, спецсоставы, металлопрокат) ищи у производителей.
 
 Материалы:
 ${materials.map((m: any, i: number) => `${i + 1}. ${m.name}${m.unit ? ' (' + m.unit + ')' : ''}`).join('\n')}
@@ -21,21 +17,36 @@ ${materials.map((m: any, i: number) => `${i + 1}. ${m.name}${m.unit ? ' (' + m.u
 {"results":[{"name":"название из списка","price":1234.56,"unit":"ед","source":"магазин","url":"ссылка"}]}
 Если цена не найдена — price: null.`
 
-    const response = await (anthropic.messages.create as any)({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 2000,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-      messages: [{ role: 'user', content: prompt }]
+    // Вызов Anthropic API напрямую через fetch — без SDK TypeScript конфликтов
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY!,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'web-search-2025-03-05',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 2000,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: prompt }]
+      })
     })
 
-    const text = response.content.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('')
+    const data = await response.json()
+    const text = (data.content || [])
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text)
+      .join('')
+
     const clean = text.replace(/```json|```/g, '').trim()
     const match = clean.match(/\{[\s\S]*\}/)
-    const parsed = JSON.parse(match?.[0] || clean)
+    const parsed = JSON.parse(match?.[0] || clean || '{"results":[]}')
     const results = parsed.results || []
 
-    // Сохраняем в базу материалов
-    if (org_id) {
+    // Сохраняем найденные цены в базу
+    if (org_id && results.length) {
       const sb = createClient()
       for (const r of results) {
         if (r.price) {
@@ -54,11 +65,12 @@ ${materials.map((m: any, i: number) => `${i + 1}. ${m.name}${m.unit ? ' (' + m.u
     }
 
     return NextResponse.json({ results })
+
   } catch (err: any) {
     console.error('Price search error:', err)
-    // Возвращаем демо-данные если AI недоступен
-    const { materials } = await req.json().catch(() => ({ materials: [] }))
-    return NextResponse.json({ results: getDemoPrices(materials || []) })
+    // Демо-данные если AI недоступен
+    const body = await req.json().catch(() => ({ materials: [] }))
+    return NextResponse.json({ results: getDemoPrices(body.materials || []) })
   }
 }
 
@@ -69,9 +81,14 @@ function getDemoPrices(materials: any[]) {
     'бетон': { price: 6800, source: 'МСК-Бетон', unit: 'м3' },
     'бордюр': { price: 420, source: 'Петрович', unit: 'пог.м' },
     'геотекстиль': { price: 85, source: 'ВсеИнструменты', unit: 'м2' },
+    'геосетк': { price: 145, source: 'Леруа Мерлен', unit: 'м2' },
     'песок': { price: 980, source: 'МСК-Бетон', unit: 'м3' },
     'труба': { price: 1200, source: 'Петрович', unit: 'пог.м' },
     'кабель': { price: 320, source: 'Леруа Мерлен', unit: 'м' },
+    'светильник': { price: 8500, source: 'ВсеИнструменты', unit: 'шт' },
+    'разборк': { price: 1850, source: 'Справочник СМР', unit: 'пог.м' },
+    'устройство': { price: 1700, source: 'Справочник СМР', unit: 'м2' },
+    'монтаж': { price: 3900, source: 'Справочник СМР', unit: 'пог.м' },
   }
   return materials.map((m: any) => {
     const n = m.name.toLowerCase()
