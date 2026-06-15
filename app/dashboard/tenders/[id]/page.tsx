@@ -8,12 +8,14 @@ function fmt(n: number) {
   if (!n && n !== 0) return '—'
   return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 }).format(n) + ' ₽'
 }
-function fmtN(n: number) { return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(n) }
+function fmtN(n: number) {
+  return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 2 }).format(n)
+}
 
 export default function TenderPage({ params }: { params: { id: string } }) {
   const [tender, setTender] = useState<any>(null)
   const [sections, setSections] = useState<any[]>([])
-  const [purchaseMats, setPurchaseMats] = useState<any[]>([])
+  const [items, setItems] = useState<any[]>([])
   const [priceResults, setPriceResults] = useState<Record<string, any>>({})
   const [tab, setTab] = useState<'items' | 'prices'>('items')
   const [searching, setSearching] = useState(false)
@@ -25,61 +27,40 @@ export default function TenderPage({ params }: { params: { id: string } }) {
   useEffect(() => {
     const load = async () => {
       const sb = createClient()
-      const [{ data: t }, { data: items }, { data: mats }] = await Promise.all([
-        sb.from('tenders').select('*').eq('id', params.id).single(),
-        sb.from('tender_items').select('*').eq('tender_id', params.id).order('sort_order'),
-        sb.from('tender_item_materials').select('*').eq('tender_id', params.id),
-      ])
+      const { data: t } = await sb.from('tenders').select('*').eq('id', params.id).single()
       if (!t) return
       setTender(t)
 
-      // Group items by section
-      const itemMap: Record<string, any> = {}
-      for (const item of (items || [])) { item.materials = []; itemMap[item.id] = item }
-      for (const mat of (mats || [])) { if (itemMap[mat.item_id]) itemMap[mat.item_id].materials.push(mat) }
+      const { data: its } = await sb.from('tender_items').select('*').eq('tender_id', params.id).order('sort_order')
+      const allItems = its || []
+      setItems(allItems)
 
+      // Группируем по разделам
       const secMap: Record<string, any> = {}
-      for (const item of Object.values(itemMap)) {
-        const key = item.section_number || '0'
+      for (const item of allItems) {
+        const key = item.section_number || item.section_name || '0'
         if (!secMap[key]) secMap[key] = { number: item.section_number, name: item.section_name, items: [], total: 0 }
         secMap[key].items.push(item)
         secMap[key].total += item.total || 0
       }
       setSections(Object.values(secMap))
 
-      // Build purchase materials list
-      const matMap: Record<string, any> = {}
-      for (const item of Object.values(itemMap)) {
-        for (const mat of (item.materials || [])) {
-          if (mat.is_customer_supply) continue
-          const key = mat.name.trim().toLowerCase()
-          if (!matMap[key]) matMap[key] = { name: mat.name, unit: mat.unit, quantity: 0 }
-          matMap[key].quantity += mat.quantity || 0
-        }
-      }
-      // Fallback: use items if no materials
-      if (Object.keys(matMap).length === 0) {
-        for (const item of Object.values(itemMap)) {
-          const key = item.name.trim().toLowerCase().slice(0, 80)
-          matMap[key] = { name: item.name, unit: item.unit, quantity: item.quantity }
-        }
-      }
-      setPurchaseMats(Object.values(matMap))
-
-      // Check cached prices from DB
+      // Загружаем кешированные цены из materials
       const { data: profile } = await sb.from('profiles').select('org_id').single()
       if (profile?.org_id) {
-        const names = Object.keys(matMap)
-        const { data: cachedMats } = await sb.from('materials').select('name, last_price, last_source').eq('org_id', profile.org_id)
-        if (cachedMats?.length) {
+        const { data: mats } = await sb.from('materials').select('*').eq('org_id', profile.org_id)
+        if (mats?.length) {
           const cached: Record<string, any> = {}
-          for (const cm of cachedMats) {
-            const key = cm.name.toLowerCase()
-            if (matMap[key] && cm.last_price) {
-              cached[key] = { price: cm.last_price, source: cm.last_source || 'база', total: cm.last_price * matMap[key].quantity }
+          for (const m of mats) {
+            cached[m.name.toLowerCase()] = {
+              price: m.last_price,
+              source: m.last_source,
+              url: m.last_source_url,
+              total: m.last_price * 1,
+              from_db: true,
             }
           }
-          if (Object.keys(cached).length) setPriceResults(cached)
+          setPriceResults(cached)
         }
       }
     }
@@ -92,38 +73,59 @@ export default function TenderPage({ params }: { params: { id: string } }) {
   }
 
   async function searchAllPrices() {
-    if (searching || !purchaseMats.length) return
+    if (searching || !items.length) return
     setSearching(true)
     setLogs([])
     const startTime = Date.now()
-    addLog('Запуск AI-поиска цен по Москве 2025–2026...', 'log-s')
+    addLog('Запуск поиска цен...', 'log-s')
+    addLog('Шаг 1: ищем в базе расценок компании', 'log-s')
+    addLog('Шаг 2: остальное — AI поиск в Яндексе', 'log-s')
 
     const sb = createClient()
     const { data: profile } = await sb.from('profiles').select('org_id').single()
 
-    const BATCH = 5
+    const BATCH = 3
     const results = { ...priceResults }
 
-    for (let i = 0; i < purchaseMats.length; i += BATCH) {
-      const batch = purchaseMats.slice(i, i + BATCH)
-      setSearchText(`Ищем ${i + 1}–${Math.min(i + BATCH, purchaseMats.length)} из ${purchaseMats.length}...`)
-      addLog(`[${i + 1}–${Math.min(i + BATCH, purchaseMats.length)}/${purchaseMats.length}] ${batch.map((m: any) => m.name.split(' ').slice(0, 3).join(' ')).join(', ')}...`, 'log-s')
+    for (let i = 0; i < items.length; i += BATCH) {
+      const batch = items.slice(i, i + BATCH)
+      setSearchText(`${i + 1}–${Math.min(i + BATCH, items.length)} из ${items.length}`)
+      addLog(`[${i + 1}–${Math.min(i + BATCH, items.length)}/${items.length}] ${batch.map((m: any) => m.name.split(' ').slice(0, 3).join(' ')).join(', ')}...`, 'log-s')
 
       try {
-        const res = await fetch('https://latlduzqzoqijpvmeecb.supabase.co/functions/v1/search-prices', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ materials: batch, org_id: profile?.org_id })
-        })
+        const res = await fetch(
+          'https://latlduzqzoqijpvmeecb.supabase.co/functions/v1/search-prices',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              materials: batch.map((item: any) => ({
+                name: item.name,
+                unit: item.unit,
+                quantity: item.quantity,
+              })),
+              org_id: profile?.org_id,
+            })
+          }
+        )
         const { results: apiResults } = await res.json()
+
         for (const r of (apiResults || [])) {
           const key = r.name.toLowerCase()
-          const m = purchaseMats.find((m: any) => m.name.toLowerCase() === key)
-          if (r.price && m) {
-            results[key] = { price: r.price, source: r.source, total: r.price * m.quantity }
-            addLog(`✓ ${r.name.slice(0, 45)} — ${fmt(r.price)}/${r.unit || 'ед.'} [${r.source}]`, 'log-ok')
+          const item = batch.find((m: any) => m.name.toLowerCase() === key)
+          if (r.price) {
+            results[key] = {
+              price: r.price,
+              source: r.source,
+              url: r.url,
+              note: r.note,
+              total: r.price * (item?.quantity || 1),
+              from_db: r.from_db,
+            }
+            const srcLabel = r.from_db ? `[База расценок]` : `[${r.source || 'AI'}]`
+            addLog(`✓ ${r.name.slice(0, 50)} — ${fmt(r.price)}/${r.unit || 'ед.'} ${srcLabel}`, 'log-ok')
           } else {
-            addLog(`✗ ${r.name?.slice(0, 45) || key} — не найдено`, 'log-err')
+            addLog(`✗ ${r.name?.slice(0, 50)} — не найдено`, 'log-err')
           }
         }
       } catch (e: any) {
@@ -132,51 +134,68 @@ export default function TenderPage({ params }: { params: { id: string } }) {
 
       setPriceResults({ ...results })
       updateSummary(results)
-      await new Promise(r => setTimeout(r, 300))
+      await new Promise(r => setTimeout(r, 200))
     }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(0)
     const found = Object.values(results).filter((r: any) => r.price > 0).length
-    addLog(`Готово за ${elapsed} сек. Найдено: ${found}/${purchaseMats.length}`, 'log-ok')
+    addLog(`✓ Готово за ${elapsed} сек. Найдено: ${found}/${items.length}`, 'log-ok')
     setSearchText('')
     setSearching(false)
     updateSummary(results)
   }
 
   function updateSummary(results: Record<string, any>) {
-    const found = purchaseMats.filter((m: any) => results[m.name.toLowerCase()]?.price > 0)
-    const total = found.reduce((a: number, m: any) => { const r = results[m.name.toLowerCase()]; return a + (r?.total || 0) }, 0)
-    setSummary({ found: found.length, total: purchaseMats.length, totalCost: total, missing: purchaseMats.length - found.length })
+    const found = items.filter((m: any) => results[m.name.toLowerCase()]?.price > 0)
+    const fromDB = found.filter((m: any) => results[m.name.toLowerCase()]?.from_db)
+    const fromAI = found.filter((m: any) => !results[m.name.toLowerCase()]?.from_db)
+    const total = found.reduce((a: number, m: any) => {
+      const r = results[m.name.toLowerCase()]
+      return a + (r?.price || 0) * (m.quantity || 1)
+    }, 0)
+    setSummary({ found: found.length, fromDB: fromDB.length, fromAI: fromAI.length, total: items.length, totalCost: total, missing: items.length - found.length })
   }
 
   function updatePrice(key: string, val: string, qty: number) {
     const p = parseFloat(val) || 0
-    const newResults = { ...priceResults, [key]: { ...(priceResults[key] || {}), price: p, total: p * qty, source: priceResults[key]?.source || 'вручную' } }
+    const newResults = {
+      ...priceResults,
+      [key]: { ...(priceResults[key] || {}), price: p, total: p * qty, source: priceResults[key]?.source || 'вручную' }
+    }
     setPriceResults(newResults)
     updateSummary(newResults)
   }
 
   function exportKP() {
     if (!tender) return
-    const rows: any[][] = [['№', 'Наименование', 'Ед.', 'Кол-во', 'СМР/ед.', 'Итого']]
-    for (const s of sections) {
-      rows.push([s.number, s.name, '', '', '', s.total])
-      for (const item of s.items) rows.push([item.item_number || '', item.name, item.unit || '', item.quantity, item.smr_price || 0, item.total || 0])
+    const rows: any[][] = [['Наименование', 'Ед.', 'Кол-во', 'Цена СМР', 'Итого СМР', 'Цена найдена', 'Источник', 'Ссылка']]
+    for (const item of items) {
+      const key = item.name.toLowerCase()
+      const res = priceResults[key]
+      rows.push([
+        item.name,
+        item.unit || '',
+        item.quantity,
+        item.smr_price || 0,
+        item.total || 0,
+        res?.price || '',
+        res?.source || '',
+        res?.url || '',
+      ])
     }
-    rows.push(['', 'ИТОГО', '', '', '', tender.total || 0])
     const wb = XLSX.utils.book_new()
     const ws = XLSX.utils.aoa_to_sheet(rows)
-    ws['!cols'] = [6, 50, 6, 10, 12, 14].map(w => ({ wch: w }))
-    XLSX.utils.book_append_sheet(wb, ws, 'Смета')
-    const pRows = [['Материал', 'Ед.', 'Кол-во', 'Цена', 'Источник', 'Итого']]
-    for (const m of purchaseMats) { const r = priceResults[m.name.toLowerCase()]; pRows.push([m.name, m.unit || '', m.quantity, r?.price || '', r?.source || '', r?.total || '']) }
-    const ws2 = XLSX.utils.aoa_to_sheet(pRows)
-    ws2['!cols'] = [50, 8, 12, 14, 16, 16].map(w => ({ wch: w }))
-    XLSX.utils.book_append_sheet(wb, ws2, 'Цены материалов')
+    ws['!cols'] = [50, 8, 10, 12, 14, 12, 20, 40].map(w => ({ wch: w }))
+    XLSX.utils.book_append_sheet(wb, ws, 'КП')
     XLSX.writeFile(wb, `КП_${(tender.title || 'export').slice(0, 30)}.xlsx`)
   }
 
-  if (!tender) return <div className="loading-screen"><div className="loading-logo">T</div><div className="loading-text">Загружаем тендер...</div></div>
+  if (!tender) return (
+    <div className="loading-screen">
+      <div className="loading-logo">T</div>
+      <div className="loading-text">Загружаем тендер...</div>
+    </div>
+  )
 
   return (
     <>
@@ -196,10 +215,10 @@ export default function TenderPage({ params }: { params: { id: string } }) {
 
       <div style={{ padding: '16px 24px 0' }}>
         <div className="stats" style={{ marginBottom: 12 }}>
+          <div className="stat"><div className="stat-label">Позиций</div><div className="stat-val">{items.length}</div></div>
           <div className="stat"><div className="stat-label">Разделов</div><div className="stat-val">{sections.length}</div></div>
-          <div className="stat"><div className="stat-label">Позиций</div><div className="stat-val">{sections.reduce((a, s) => a + s.items.length, 0)}</div></div>
           <div className="stat"><div className="stat-label">Итого СМР</div><div className="stat-val green">{fmt(tender.total_smr || 0)}</div></div>
-          <div className="stat"><div className="stat-label">Итого всего</div><div className="stat-val green">{fmt(tender.total || 0)}</div></div>
+          <div className="stat"><div className="stat-label">Итого</div><div className="stat-val green">{fmt(tender.total || 0)}</div></div>
         </div>
         <div className="tabs">
           <button className={`tab-btn ${tab === 'items' ? 'active' : ''}`} onClick={() => setTab('items')}>Работы</button>
@@ -207,6 +226,7 @@ export default function TenderPage({ params }: { params: { id: string } }) {
         </div>
       </div>
 
+      {/* ВКЛАДКА: РАБОТЫ */}
       {tab === 'items' && (
         <div className="card" style={{ borderRadius: 0, borderLeft: 'none', borderRight: 'none', borderBottom: 'none', boxShadow: 'none' }}>
           <div className="tbl-wrap">
@@ -215,42 +235,60 @@ export default function TenderPage({ params }: { params: { id: string } }) {
                 <th>Наименование работы</th>
                 <th style={{ width: 60 }}>Ед.</th>
                 <th style={{ width: 90, textAlign: 'right' }}>Кол-во</th>
-                <th style={{ width: 110, textAlign: 'right' }}>СМР/ед. ₽</th>
-                <th style={{ width: 120, textAlign: 'right' }}>Итого ₽</th>
+                <th style={{ width: 110, textAlign: 'right' }}>Цена ₽</th>
+                <th style={{ width: 130, textAlign: 'right' }}>Итого ₽</th>
               </tr></thead>
               <tbody>
-                {sections.map(s => <>
-                  <tr key={s.number} className="sec-row"><td colSpan={4}>{s.number}. {s.name}</td><td className="td-mono td-right" style={{ paddingRight: 12 }}>{fmtN(s.total)} ₽</td></tr>
-                  {s.items.map((item: any) => (
-                    <tr key={item.id}>
-                      <td style={{ paddingLeft: 20 }}>{item.name}</td>
-                      <td style={{ color: 'var(--ink3)' }}>{item.unit || ''}</td>
-                      <td className="td-mono td-right">{fmtN(item.quantity)}</td>
-                      <td className="td-mono td-right">{fmtN(item.smr_price)}</td>
-                      <td className="td-mono td-right td-green">{fmtN(item.total)}</td>
-                    </tr>
-                  ))}
-                </>)}
+                {sections.map(s => (
+                  <>
+                    {s.name && (
+                      <tr key={s.number} className="sec-row">
+                        <td colSpan={4}>{s.number ? `${s.number}. ` : ''}{s.name}</td>
+                        <td className="td-mono td-right" style={{ paddingRight: 12 }}>{fmtN(s.total)} ₽</td>
+                      </tr>
+                    )}
+                    {s.items.map((item: any) => (
+                      <tr key={item.id}>
+                        <td style={{ paddingLeft: s.name ? 20 : 12 }}>{item.name}</td>
+                        <td style={{ color: 'var(--ink3)' }}>{item.unit || ''}</td>
+                        <td className="td-mono td-right">{fmtN(item.quantity)}</td>
+                        <td className="td-mono td-right">{fmtN(item.smr_price || 0)}</td>
+                        <td className="td-mono td-right td-green">{fmtN(item.total || 0)}</td>
+                      </tr>
+                    ))}
+                  </>
+                ))}
               </tbody>
             </table>
           </div>
           <div className="totals-bar">
+            <div><div className="tot-label">Позиций</div><div className="tot-val">{items.length}</div></div>
             <div><div className="tot-label">Разделов</div><div className="tot-val">{sections.length}</div></div>
-            <div><div className="tot-label">Позиций</div><div className="tot-val">{sections.reduce((a, s) => a + s.items.length, 0)}</div></div>
             <div><div className="tot-label">Итого СМР</div><div className="tot-val">{fmt(tender.total_smr || 0)}</div></div>
             <div><div className="tot-label">ИТОГО</div><div className="tot-val accent">{fmt(tender.total || 0)}</div></div>
           </div>
         </div>
       )}
 
+      {/* ВКЛАДКА: ПОИСК ЦЕН */}
       {tab === 'prices' && (
         <>
           <div className="price-toolbar">
-            <div className="price-toolbar-title">AI-поиск цен — Москва 2025–2026</div>
-            {searching && <div className="spinner-wrap"><div className="spinner"/><span>{searchText}</span></div>}
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 600, fontSize: 14 }}>Поиск цен — База расценок + AI Яндекс</div>
+              <div style={{ fontSize: 12, color: 'var(--ink3)', marginTop: 2 }}>
+                Сначала ищем в вашей базе расценок, затем AI ищет в интернете со ссылками
+              </div>
+            </div>
+            {searching && (
+              <div className="spinner-wrap">
+                <div className="spinner"/>
+                <span style={{ fontSize: 12, color: 'var(--ink3)' }}>{searchText}</span>
+              </div>
+            )}
             <button className="btn btn-blue" onClick={searchAllPrices} disabled={searching}>
               <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" style={{ width: 14, height: 14 }}><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-              {searching ? 'Ищем...' : 'Найти все цены (AI)'}
+              {searching ? 'Ищем...' : 'Найти все цены'}
             </button>
             <button className="btn btn-sm" onClick={exportKP}>↓ Excel</button>
           </div>
@@ -265,24 +303,24 @@ export default function TenderPage({ params }: { params: { id: string } }) {
             <table>
               <thead><tr>
                 <th style={{ width: 36 }}>#</th>
-                <th>Материал / позиция</th>
+                <th>Позиция</th>
                 <th style={{ width: 55 }}>Ед.</th>
-                <th style={{ width: 100, textAlign: 'right' }}>Кол-во</th>
-                <th style={{ width: 150, textAlign: 'right' }}>Цена за ед.</th>
-                <th style={{ width: 80 }}>Источник</th>
-                <th style={{ width: 140, textAlign: 'right' }}>Стоимость</th>
-                <th style={{ width: 90, textAlign: 'center' }}>Статус</th>
+                <th style={{ width: 80, textAlign: 'right' }}>Кол-во</th>
+                <th style={{ width: 130, textAlign: 'right' }}>Найденная цена</th>
+                <th style={{ width: 130 }}>Источник</th>
+                <th style={{ width: 130, textAlign: 'right' }}>Стоимость</th>
+                <th style={{ width: 80, textAlign: 'center' }}>Статус</th>
               </tr></thead>
               <tbody>
-                {purchaseMats.map((m: any, i: number) => {
-                  const key = m.name.toLowerCase()
+                {items.map((item: any, i: number) => {
+                  const key = item.name.toLowerCase()
                   const res = priceResults[key]
                   return (
-                    <tr key={i} style={res?.price ? { background: 'rgba(22,105,68,.03)' } : {}}>
+                    <tr key={item.id || i} style={res?.price ? { background: 'rgba(22,105,68,.03)' } : {}}>
                       <td className="td-mono" style={{ color: 'var(--ink3)' }}>{i + 1}</td>
-                      <td style={{ fontSize: 13, maxWidth: 280 }}>{m.name}</td>
-                      <td style={{ color: 'var(--ink3)' }}>{m.unit || ''}</td>
-                      <td className="td-mono td-right">{fmtN(m.quantity)}</td>
+                      <td style={{ fontSize: 13, maxWidth: 300 }}>{item.name}</td>
+                      <td style={{ color: 'var(--ink3)' }}>{item.unit || ''}</td>
+                      <td className="td-mono td-right">{fmtN(item.quantity)}</td>
                       <td style={{ textAlign: 'right' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'flex-end' }}>
                           <input
@@ -290,16 +328,31 @@ export default function TenderPage({ params }: { params: { id: string } }) {
                             type="number"
                             value={res?.price || ''}
                             placeholder="0.00"
-                            onChange={e => updatePrice(key, e.target.value, m.quantity)}
+                            onChange={e => updatePrice(key, e.target.value, item.quantity)}
                           />
-                          {res?.source && <span className="src-chip">{res.source}</span>}
                         </div>
                       </td>
-                      <td/>
-                      <td style={{ textAlign: 'right' }}>{res?.total ? <span className="td-mono td-green">{fmt(res.total)}</span> : '—'}</td>
+                      <td>
+                        {res?.url ? (
+                          <a href={res.url} target="_blank" rel="noopener noreferrer"
+                            style={{ fontSize: 11, color: 'var(--blue)', textDecoration: 'none', display: 'block', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                            title={res.source}>
+                            🔗 {res.source}
+                          </a>
+                        ) : res?.source ? (
+                          <span className="src-chip">{res.source}</span>
+                        ) : null}
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        {res?.price
+                          ? <span className="td-mono td-green">{fmt(res.price * (item.quantity || 1))}</span>
+                          : '—'}
+                      </td>
                       <td style={{ textAlign: 'center' }}>
                         {res?.price
-                          ? <span className="badge badge-green">найдено</span>
+                          ? <span className={`badge ${res.from_db ? 'badge-blue' : 'badge-green'}`}>
+                              {res.from_db ? 'база' : 'AI'}
+                            </span>
                           : <span className="badge badge-gray">—</span>}
                       </td>
                     </tr>
@@ -312,9 +365,9 @@ export default function TenderPage({ params }: { params: { id: string } }) {
           {summary && (
             <div className="summary-box">
               <div><div className="tot-label">Найдено</div><div className="tot-val">{summary.found} / {summary.total}</div></div>
+              <div><div className="tot-label">Из базы расценок</div><div className="tot-val">{summary.fromDB}</div></div>
+              <div><div className="tot-label">Найдено AI</div><div className="tot-val accent">{summary.fromAI}</div></div>
               <div><div className="tot-label">Стоимость</div><div className="tot-val accent">{fmt(summary.totalCost)}</div></div>
-              <div><div className="tot-label">Не найдено</div><div className="tot-val">{summary.missing > 0 ? `${summary.missing} позиций` : 'все ✓'}</div></div>
-              <div><div className="tot-label">База обновлена</div><div className="tot-val">✓</div></div>
             </div>
           )}
         </>
