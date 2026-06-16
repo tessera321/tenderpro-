@@ -122,7 +122,9 @@ export default function TenderPage({ params }: { params: { id: string } }) {
               total: r.price * (item?.quantity || 1),
               from_db: r.from_db,
             }
-            const srcLabel = r.from_db ? `[База расценок]` : `[${r.source || 'AI'}]`
+            const srcLabel = r.from_db ? '[База расценок]' : `[AI: ${r.source || 'интернет'}]`
+            const fromWarning = r.price_is_from ? " ⚠️ цена «от»" : ""
+            const typeLabel = r.item_type === "work" ? "🔧" : "📦"
             addLog(`✓ ${r.name.slice(0, 50)} — ${fmt(r.price)}/${r.unit || 'ед.'} ${srcLabel}`, 'log-ok')
           } else {
             addLog(`✗ ${r.name?.slice(0, 50)} — не найдено`, 'log-err')
