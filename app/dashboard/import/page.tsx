@@ -80,12 +80,12 @@ export default function ImportPage() {
       }) as any[][]
 
       // Извлекаем только значимые строки прямо на фронтенде
-      const meaningfulRows = extractMeaningfulRows(allRows)
+      const meaningfulRows = allRows
 
       setProgress(40)
       setStatus(`Найдено ${meaningfulRows.length} позиций, отправляем в AI...`)
 
-      if (meaningfulRows.length === 0) {
+      if (allRows.length === 0) {
         throw new Error('Не удалось найти позиции в файле. Убедитесь что файл содержит наименования работ с единицами измерения.')
       }
 
