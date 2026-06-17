@@ -10,144 +10,109 @@ function fmt(n: number) {
 }
 
 function toNum(v: any): number {
-  if (!v && v !== 0) return 0
+  if (v === null || v === undefined || v === '') return 0
   const n = parseFloat(String(v).replace(/\s/g, '').replace(',', '.'))
   return isNaN(n) ? 0 : n
 }
 
 function toStr(v: any): string {
-  const s = String(v ?? '').trim()
+  const s = String(v ?? '').trim().replace(/\n/g, ' ')
   return (s === 'null' || s === 'undefined' || s === 'nan') ? '' : s
 }
 
-// ============================================================
-// ДЕТЕРМИНИРОВАННЫЙ ПАРСЕР — читает по номерам колонок
-// Работает для стандартного формата оферты с колонками:
-// 0=№, 1=раздел, 2=наименование, 4=тип_материала, 5=комментарий,
-// 6=ед.изм, 7=норма, 8=кол-во, 10=валюта, 11=мат/ед, 12=смр/ед,
-// 13=итого/ед, 14=мат_всего, 15=смр_всего, 16=итого_всего
-// ============================================================
-function parseOferta(rows: any[][]): { items: any[], total: number } | null {
-  // Ищем строку заголовка (где есть "Наименование работ" или "№ п/п")
+function parseOferta(rows: any[][]): { items: any[], total: number, totalSmr: number } | null {
+  // 1. Ищем заголовочную строку
   let headerRow = -1
-  let colMap: Record<string, number> = {}
-
-  for (let i = 0; i < Math.min(30, rows.length); i++) {
-    const row = rows[i]
-    for (let j = 0; j < row.length; j++) {
-      const cell = toStr(row[j]).toLowerCase()
-      if (cell.includes('наименование работ') || cell.includes('наименование вида работ')) {
-        headerRow = i
-        colMap.name = j
-      }
-      if (cell === '№ п/п') colMap.num = j
-      if (cell === '№ раздела') colMap.section = j
-      if (cell.includes('комментарий') && !cell.includes('участник')) colMap.comment = j
-      if (cell.startsWith('ед.') || cell === 'ед. изм') colMap.unit = j
-      if (cell.includes('общее кол') || cell === 'объем' || cell.includes('кол-во')) colMap.qty = j
+  for (let i = 0; i < Math.min(25, rows.length); i++) {
+    const row = rows[i] || []
+    const txt = row.map((v: any) => toStr(v).toLowerCase()).join(' ')
+    if (txt.includes('наименование') && txt.includes('ед') && (txt.includes('кол') || txt.includes('объем'))) {
+      headerRow = i
+      break
     }
-    if (headerRow >= 0) break
   }
-
   if (headerRow < 0) return null
 
-  // Ищем подзаголовки (строка после заголовка с "Материалы", "СМР", "Всего")
-  for (let i = headerRow + 1; i < Math.min(headerRow + 5, rows.length); i++) {
-    const row = rows[i]
-    for (let j = 0; j < row.length; j++) {
-      const cell = toStr(row[j]).toLowerCase()
-      if (cell === 'смр') colMap.smr_unit = j
-      if (cell === 'всего' && !colMap.total_unit) colMap.total_unit = j
-      if (cell === 'материалы' && !colMap.mat_unit) colMap.mat_unit = j
+  // 2. Ищем строку ИТОГО в конце — берём итог оттуда
+  let grandTotal = 0
+  let grandSmr = 0
+  for (let i = rows.length - 1; i >= Math.max(0, rows.length - 20); i--) {
+    const row = rows[i] || []
+    const txt = row.map((v: any) => toStr(v)).join(' ').toLowerCase()
+    if (txt.includes('итого') || txt.includes('всего')) {
+      // Ищем самое большое число в строке как итог
+      for (let j = row.length - 1; j >= 0; j--) {
+        const n = toNum(row[j])
+        if (n > 10000) {
+          grandTotal = n
+          // СМР — предыдущая колонка
+          if (j > 0) grandSmr = toNum(row[j - 1])
+          break
+        }
+      }
+      if (grandTotal > 0) break
     }
   }
 
-  // Дефолтные значения если не нашли через заголовки
-  if (colMap.num === undefined) colMap.num = 0
-  if (colMap.section === undefined) colMap.section = 1
-  if (colMap.name === undefined) colMap.name = 2
-  if (colMap.comment === undefined) colMap.comment = 5
-  if (colMap.unit === undefined) colMap.unit = 6
-  if (colMap.qty === undefined) colMap.qty = 8
-  if (colMap.mat_unit === undefined) colMap.mat_unit = 11
-  if (colMap.smr_unit === undefined) colMap.smr_unit = 12
-  if (colMap.total_unit === undefined) colMap.total_unit = 13
-  // Итоговые суммы
-  const totalAllCol = 16
-
+  // 3. Собираем позиции — строки с номером п/п
   const items: any[] = []
-  let grandTotal = 0
+  const COLS = { num: 0, section: 1, name: 2, matType: 4, comment: 5, unit: 6, norm: 7, qty: 8, matP: 11, smrP: 12, totalUnit: 13, totalAll: 16 }
+
+  // Находим реальные индексы колонок из заголовка (адаптируемся к разным файлам)
+  const hRow = rows[headerRow] || []
+  const hRow2 = rows[headerRow + 1] || []
+  let colUnit = 6, colQty = 8, colMatP = 11, colSmrP = 12, colTotalUnit = 13, colTotalAll = 16
+
+  for (let j = 0; j < hRow.length; j++) {
+    const h = toStr(hRow[j]).toLowerCase()
+    if (h.includes('ед')) colUnit = j
+    if (h.includes('кол') && h.includes('общ')) colQty = j
+  }
+  for (let j = 0; j < hRow2.length; j++) {
+    const h = toStr(hRow2[j]).toLowerCase()
+    if (h === 'смр') colSmrP = j
+    if (h === 'материалы' && j > 8 && colMatP === 11) colMatP = j
+    if (h === 'всего' && j > colSmrP) colTotalUnit = j
+  }
+  colTotalAll = colTotalUnit + 3  // Итого всего = итого/ед + 3 колонки
 
   for (let i = headerRow + 2; i < rows.length; i++) {
-    const row = rows[i]
-    if (!row || row.length < 3) continue
+    const row = rows[i] || []
+    const num = toStr(row[COLS.num])
+    const name = toStr(row[COLS.name])
+    if (!num || !/^\d+$/.test(num) || !name) continue
 
-    const num = toStr(row[colMap.num])
-    const name = toStr(row[colMap.name])
-    const unit = toStr(row[colMap.unit])
-    const comment = toStr(row[colMap.comment])
+    const unit = toStr(row[colUnit])
+    const matType = toStr(row[COLS.matType])
+    const comment = toStr(row[COLS.comment])
+    const qty = toNum(row[colQty])
+    const matP = toNum(row[colMatP])
+    const smrP = toNum(row[colSmrP])
+    const totalUnit = toNum(row[colTotalUnit])
 
-    // Позиция основной таблицы: имеет номер п/п И наименование
-    const hasNum = num && /^\d+$/.test(num)
-    const hasName = name.length > 2
-    const hasUnit = unit.length > 0 && unit.length < 20
-
-    if (!hasNum || !hasName) continue
-
-    const qty = toNum(row[colMap.qty])
-    const matPrice = toNum(row[colMap.mat_unit])
-    const smrPrice = toNum(row[colMap.smr_unit])
-    const totalPrice = toNum(row[colMap.total_unit]) || (matPrice + smrPrice)
-    const totalAll = toNum(row[totalAllCol]) || (qty * totalPrice)
-
-    // Пропускаем строки-итоги разделов (итоговая стоимость совпадает с нашим grandTotal)
-    if (!hasUnit && totalAll > 1000000) continue
+    // Итого позиции: берём из col16 или col13*qty или col11*qty (материалы)
+    let total = toNum(row[colTotalAll])
+    if (!total && matType) total = matP * qty  // материал без итога
+    if (!total && totalUnit) total = totalUnit * qty
 
     items.push({
-      name: name.replace(/\n/g, ' '),
-      unit: hasUnit ? unit : '',
+      name: name.substring(0, 200),
+      unit,
       quantity: qty,
-      smr_price: smrPrice,
-      mat_price: matPrice,
-      total_price: totalPrice,
-      total: totalAll,
-      comment: comment || '',
-      type: name.toLowerCase().includes('раствор') || name.toLowerCase().includes('материал') ||
-            name.toLowerCase().includes('цемент') || name.toLowerCase().includes('бентонит') ||
-            name.toLowerCase().includes('вода') ? 'material' : 'work'
+      smr_price: smrP,
+      mat_price: matP,
+      total_price: totalUnit || (smrP + matP),
+      total,
+      comment,
+      type: matType ? 'material' : 'work'
     })
-
-    if (totalAll > 0 && totalAll < 100_000_000) grandTotal += totalAll
   }
 
-  return { items, total: grandTotal }
-}
+  if (items.length < 2) return null
+  // Если не нашли итог — суммируем листовые позиции (без дублирования)
+  if (!grandTotal) grandTotal = items.reduce((s, i) => s + i.total, 0)
 
-// ============================================================
-// УНИВЕРСАЛЬНЫЙ ПАРСЕР ЧЕРЕЗ CLAUDE (fallback)
-// ============================================================
-async function parseViaAI(rows: any[][], filename: string, orgId: string, tenderMeta: any) {
-  const allLines = rows
-    .map((row: any[], i: number) => {
-      const cells = (row || [])
-        .map((v: any) => String(v ?? '').trim().replace(/\n/g, ' '))
-        .filter((v: string) => v && v !== 'null')
-        .map((v: string) => v.substring(0, 80))
-      return cells.length > 0 ? `${i}|${cells.join('\t')}` : ''
-    })
-    .filter(Boolean)
-    .join('\n')
-
-  const res = await fetch(
-    'https://latlduzqzoqijpvmeecb.supabase.co/functions/v1/parse-tender',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rows, filename, org_id: orgId, tender_meta: tenderMeta })
-    }
-  )
-  if (!res.ok) throw new Error(`Ошибка API: ${res.status}`)
-  return await res.json()
+  return { items, total: grandTotal, totalSmr: grandSmr }
 }
 
 export default function ImportPage() {
@@ -164,46 +129,28 @@ export default function ImportPage() {
   const [deadline, setDeadline] = useState('')
 
   async function processFile(file: File) {
-    setResult(null)
-    setError('')
-    setProgress(10)
-    setStatus('Читаем файл...')
-
+    setResult(null); setError(''); setProgress(10); setStatus('Читаем файл...')
     try {
       const buf = await file.arrayBuffer()
-      setProgress(20)
-      setStatus('Парсим структуру...')
-
+      setProgress(25); setStatus('Парсим структуру...')
       const wb = XLSX.read(buf, { type: 'array' })
       const ws = wb.Sheets[wb.SheetNames[0]]
-      const rows = XLSX.utils.sheet_to_json(ws, {
-        header: 1, defval: null, raw: false, blankrows: true
-      }) as any[][]
-
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: false, blankrows: true }) as any[][]
       setProgress(40)
 
       const sb = createClient()
       const { data: profile } = await sb.from('profiles').select('org_id').single()
       if (!profile?.org_id) throw new Error('Профиль не найден')
 
-      const tenderMeta = {
-        title: titleVal || undefined,
-        customer: customer || undefined,
-        platform: platform || undefined,
-        deadline: deadline || undefined,
-      }
+      const tenderMeta = { title: titleVal || undefined, customer: customer || undefined, platform: platform || undefined, deadline: deadline || undefined }
 
-      // ШАГ 1: пробуем детерминированный парсер
+      // Шаг 1: детерминированный парсер
       setStatus('Анализируем структуру таблицы...')
       const detResult = parseOferta(rows)
-
       let parsed: any
 
-      if (detResult && detResult.items.length >= 3) {
-        // Детерминированный парсер сработал — сохраняем в базу
-        setProgress(60)
-        setStatus(`Найдено ${detResult.items.length} позиций, сохраняем...`)
-
+      if (detResult && detResult.items.length >= 2) {
+        setProgress(70); setStatus(`Найдено ${detResult.items.length} позиций, сохраняем...`)
         const title = titleVal || file.name.replace(/\.[^.]+$/, '')
         const { data: tender, error: tErr } = await sb.from('tenders').insert({
           org_id: profile.org_id,
@@ -213,15 +160,14 @@ export default function ImportPage() {
           deadline: deadline || null,
           status: 'new',
           total: detResult.total,
-          total_smr: detResult.items.reduce((s, i) => s + (i.smr_price || 0) * (i.quantity || 0), 0),
+          total_smr: detResult.totalSmr,
         }).select().single()
-
         if (tErr) throw new Error(tErr.message)
 
         for (const item of detResult.items) {
           await sb.from('tender_items').insert({
             tender_id: tender.id,
-            name: item.name.substring(0, 200),
+            name: item.name,
             unit: item.unit,
             quantity: item.quantity,
             smr_price: item.smr_price,
@@ -231,92 +177,64 @@ export default function ImportPage() {
             section_name: item.comment || null,
           })
         }
-
-        parsed = {
-          title,
-          items: detResult.items,
-          tender_id: tender.id,
-          parser: 'deterministic'
-        }
+        parsed = { title, items: detResult.items, tender_id: tender.id, parser: 'deterministic', grandTotal: detResult.total }
       } else {
-        // ШАГ 2: fallback на AI парсер
-        setProgress(50)
-        setStatus('Нестандартная структура — отправляем в AI...')
-        parsed = await parseViaAI(rows, file.name, profile.org_id, tenderMeta)
+        // Шаг 2: AI fallback
+        setProgress(50); setStatus('Нестандартная структура — отправляем в AI...')
+        const res = await fetch('https://latlduzqzoqijpvmeecb.supabase.co/functions/v1/parse-tender', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rows, filename: file.name, org_id: profile.org_id, tender_meta: tenderMeta })
+        })
+        if (!res.ok) throw new Error(`Ошибка API: ${res.status}`)
+        parsed = await res.json()
         if (parsed.error) throw new Error(parsed.error)
         if (!parsed.items?.length) throw new Error('Не удалось найти позиции в файле')
       }
 
-      setProgress(100)
-      setStatus('Готово!')
+      setProgress(100); setStatus('Готово!')
       setResult(parsed)
-
-    } catch (e: any) {
-      setError(e.message)
-      setProgress(0)
-      setStatus('')
-    }
+    } catch (e: any) { setError(e.message); setProgress(0); setStatus('') }
   }
+
+  const grandTotal = result?.grandTotal || result?.items?.reduce((s: number, i: any) => s + (i.total || 0), 0) || 0
 
   return (
     <>
-      <div className="topbar">
-        <div className="topbar-title">Новый тендер</div>
-      </div>
+      <div className="topbar"><div className="topbar-title">Новый тендер</div></div>
       <div className="content" style={{ maxWidth: 700 }}>
         <div className="card" style={{ marginBottom: 16 }}>
           <div className="card-head"><div className="card-title">Данные тендера</div></div>
           <div className="card-body" style={{ display: 'grid', gap: 12 }}>
             <div>
-              <label className="form-label">Название / объект (необязательно — определится из файла)</label>
-              <input className="form-input" placeholder="ЖК BESIDE 2.0 — дорожные покрытия" value={titleVal} onChange={e => setTitleVal(e.target.value)} />
+              <label className="form-label">Название / объект</label>
+              <input className="form-input" placeholder="ЖК Рождественка — усиление кладки" value={titleVal} onChange={e => setTitleVal(e.target.value)} />
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-              <div>
-                <label className="form-label">Заказчик</label>
-                <input className="form-input" placeholder="ООО ГК ФСК" value={customer} onChange={e => setCustomer(e.target.value)} />
-              </div>
+              <div><label className="form-label">Заказчик</label><input className="form-input" placeholder="ООО ГК ФСК" value={customer} onChange={e => setCustomer(e.target.value)} /></div>
               <div>
                 <label className="form-label">Площадка</label>
                 <select className="form-input" value={platform} onChange={e => setPlatform(e.target.value)}>
                   <option value="">— выбрать —</option>
-                  <option>Tender.pro</option>
-                  <option>САФМАР</option>
-                  <option>РОСЭЛТОРГ</option>
-                  <option>B2B-Center</option>
-                  <option>Прямое приглашение</option>
+                  <option>Tender.pro</option><option>САФМАР</option><option>РОСЭЛТОРГ</option><option>B2B-Center</option><option>Прямое приглашение</option>
                 </select>
               </div>
             </div>
-            <div>
-              <label className="form-label">Дедлайн</label>
-              <input className="form-input" type="date" value={deadline} onChange={e => setDeadline(e.target.value)} />
-            </div>
+            <div><label className="form-label">Дедлайн</label><input className="form-input" type="date" value={deadline} onChange={e => setDeadline(e.target.value)} /></div>
           </div>
         </div>
 
-        <div
-          className={`upload-zone ${dragging ? 'drag' : ''}`}
+        <div className={`upload-zone ${dragging ? 'drag' : ''}`}
           onClick={() => fileRef.current?.click()}
           onDragOver={e => { e.preventDefault(); setDragging(true) }}
           onDragLeave={() => setDragging(false)}
-          onDrop={e => {
-            e.preventDefault(); setDragging(false)
-            const f = e.dataTransfer.files[0]; if (f) processFile(f)
-          }}
-        >
+          onDrop={e => { e.preventDefault(); setDragging(false); const f = e.dataTransfer.files[0]; if (f) processFile(f) }}>
           <svg width="38" height="38" fill="none" stroke="currentColor" viewBox="0 0 24 24" style={{ color: 'var(--ink3)' }}>
-            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-            <polyline points="17 8 12 3 7 8"/>
-            <line x1="12" y1="3" x2="12" y2="15"/>
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
           </svg>
           <div className="upload-title">Загрузите файл от заказчика</div>
-          <div className="upload-sub">
-            Любой Excel <strong>.xlsx</strong> — ведомость работ, оферта, РСС, смета.<br/>
-            Детерминированный парсер + AI как запасной вариант.
-          </div>
-          <input ref={fileRef} type="file" accept=".xlsx,.xls,.xlsm" style={{ display: 'none' }}
-            onChange={e => { const f = e.target.files?.[0]; if (f) processFile(f) }} />
+          <div className="upload-sub">Любой Excel <strong>.xlsx</strong> — оферта, ведомость, РСС, смета</div>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls,.xlsm" style={{ display: 'none' }} onChange={e => { const f = e.target.files?.[0]; if (f) processFile(f) }} />
         </div>
 
         {progress > 0 && !result && !error && (
@@ -329,11 +247,7 @@ export default function ImportPage() {
           </div>
         )}
 
-        {error && (
-          <div style={{ marginTop: 12, background: 'var(--red-l)', color: 'var(--red)', padding: '12px 16px', borderRadius: 'var(--r)', fontSize: 13 }}>
-            ⚠️ {error}
-          </div>
-        )}
+        {error && <div style={{ marginTop: 12, background: 'var(--red-l)', color: 'var(--red)', padding: '12px 16px', borderRadius: 'var(--r)', fontSize: 13 }}>⚠️ {error}</div>}
 
         {result && (
           <div className="card" style={{ marginTop: 16 }}>
@@ -349,26 +263,21 @@ export default function ImportPage() {
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, marginBottom: 16 }}>
                 <div><div className="stat-label">Позиций</div><div style={{ fontSize: 24, fontWeight: 700 }}>{result.items?.length || 0}</div></div>
                 <div><div className="stat-label">С ценами СМР</div><div style={{ fontSize: 24, fontWeight: 700, color: 'var(--green)' }}>{result.items?.filter((i: any) => (i.smr_price || 0) > 0).length || 0}</div></div>
-                <div><div className="stat-label">Итого</div><div style={{ fontSize: 24, fontWeight: 700, color: 'var(--green)' }}>{fmt(result.items?.reduce((s: number, i: any) => s + (i.total || 0), 0) || 0)}</div></div>
+                <div><div className="stat-label">Итого (из файла)</div><div style={{ fontSize: 24, fontWeight: 700, color: 'var(--green)' }}>{fmt(grandTotal)}</div></div>
               </div>
-              <div style={{ background: 'var(--bg)', borderRadius: 'var(--r)', padding: '12px', marginBottom: 14, maxHeight: 200, overflowY: 'auto', fontSize: 12 }}>
-                {result.items?.slice(0, 10).map((item: any, i: number) => (
-                  <div key={i} style={{ padding: '4px 0', borderBottom: '1px solid var(--border)', display: 'flex', gap: 8 }}>
+              <div style={{ background: 'var(--bg)', borderRadius: 'var(--r)', padding: '12px', marginBottom: 14, maxHeight: 220, overflowY: 'auto', fontSize: 12 }}>
+                {result.items?.slice(0, 12).map((item: any, i: number) => (
+                  <div key={i} style={{ padding: '4px 0', borderBottom: '1px solid var(--border)', display: 'flex', gap: 8, alignItems: 'center' }}>
                     <span style={{ color: 'var(--ink3)', minWidth: 20 }}>{i + 1}</span>
-                    <span style={{ flex: 1 }}>{item.name?.slice(0, 60)}{item.name?.length > 60 ? '…' : ''}</span>
-                    <span style={{ color: 'var(--ink3)' }}>{item.unit}</span>
-                    <span style={{ color: 'var(--ink3)', minWidth: 40 }}>{item.quantity}</span>
-                    <span style={{ color: 'var(--green)', minWidth: 80, textAlign: 'right' }}>{item.total > 0 ? fmt(item.total) : ''}</span>
+                    <span style={{ flex: 1 }}>{item.name?.slice(0, 55)}{item.name?.length > 55 ? '…' : ''}</span>
+                    <span style={{ color: 'var(--ink3)', minWidth: 40 }}>{item.unit}</span>
+                    <span style={{ color: 'var(--green)', minWidth: 90, textAlign: 'right' }}>{item.total > 0 ? fmt(item.total) : ''}</span>
                   </div>
                 ))}
-                {result.items?.length > 10 && <div style={{ padding: '6px 0', color: 'var(--ink3)', textAlign: 'center' }}>+ ещё {result.items.length - 10} позиций</div>}
+                {result.items?.length > 12 && <div style={{ padding: '6px 0', color: 'var(--ink3)', textAlign: 'center' }}>+ ещё {result.items.length - 12} позиций</div>}
               </div>
               <div style={{ display: 'flex', gap: 10 }}>
-                {result.tender_id && (
-                  <button className="btn btn-primary" onClick={() => router.push(`/dashboard/tenders/${result.tender_id}`)}>
-                    Открыть тендер → найти цены ✦
-                  </button>
-                )}
+                {result.tender_id && <button className="btn btn-primary" onClick={() => router.push(`/dashboard/tenders/${result.tender_id}`)}>Открыть тендер → найти цены ✦</button>}
                 <button className="btn" onClick={() => { setResult(null); setProgress(0); setStatus('') }}>Загрузить другой файл</button>
               </div>
             </div>
